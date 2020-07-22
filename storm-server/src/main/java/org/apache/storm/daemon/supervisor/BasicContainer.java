@@ -37,6 +37,7 @@ import java.util.NavigableMap;
 import org.apache.commons.lang.StringUtils;
 import org.apache.storm.Config;
 import org.apache.storm.DaemonConfig;
+import org.apache.storm.ServerConstants;
 import org.apache.storm.container.ResourceIsolationInterface;
 import org.apache.storm.generated.LocalAssignment;
 import org.apache.storm.generated.ProfileAction;
@@ -76,7 +77,7 @@ public class BasicContainer extends Container {
     protected final long mediumMemoryGracePeriodMs;
     protected volatile boolean exitedEarly = false;
     protected volatile long memoryLimitMb;
-    protected volatile long memoryLimitExceededStart;
+    protected volatile long memoryLimitExceededStart = -1;
 
     /**
      * Create a new BasicContainer.
@@ -132,11 +133,11 @@ public class BasicContainer extends Container {
         this.localState = localState;
 
         if (type.isRecovery() && !type.isOnlyKillable()) {
-            synchronized (localState) {
+            synchronized (this.localState) {
                 String wid = null;
-                Map<String, Integer> workerToPort = localState.getApprovedWorkers();
+                Map<String, Integer> workerToPort = this.localState.getApprovedWorkers();
                 for (Map.Entry<String, Integer> entry : workerToPort.entrySet()) {
-                    if (port == entry.getValue().intValue()) {
+                    if (port == entry.getValue()) {
                         wid = entry.getKey();
                     }
                 }
@@ -175,7 +176,7 @@ public class BasicContainer extends Container {
     private static void removeWorkersOn(Map<String, Integer> workerToPort, int port) {
         for (Iterator<Entry<String, Integer>> i = workerToPort.entrySet().iterator(); i.hasNext(); ) {
             Entry<String, Integer> found = i.next();
-            if (port == found.getValue().intValue()) {
+            if (port == found.getValue()) {
                 LOG.warn("Deleting worker {} from state", found.getKey());
                 i.remove();
             }
@@ -244,26 +245,6 @@ public class BasicContainer extends Container {
         return exitedEarly;
     }
 
-    /**
-     * Run the given command for profiling.
-     *
-     * @param command   the command to run
-     * @param env       the environment to run the command
-     * @param logPrefix the prefix to include in the logs
-     * @param targetDir the working directory to run the command in
-     * @return true if it ran successfully, else false
-     *
-     * @throws IOException          on any error
-     * @throws InterruptedException if interrupted wile waiting for the process to exit.
-     */
-    protected boolean runProfilingCommand(List<String> command, Map<String, String> env, String logPrefix,
-                                          File targetDir) throws IOException, InterruptedException {
-        type.assertFull();
-        Process p = ClientSupervisorUtils.launchProcess(command, env, logPrefix, null, targetDir);
-        int ret = p.waitFor();
-        return ret == 0;
-    }
-
     @Override
     public boolean runProfiling(ProfileRequest request, boolean stop) throws IOException, InterruptedException {
         type.assertFull();
@@ -287,7 +268,7 @@ public class BasicContainer extends Container {
 
         File targetFile = new File(targetDir);
         if (command.size() > 0) {
-            return runProfilingCommand(command, env, logPrefix, targetFile);
+            return resourceIsolationManager.runProfilingCommand(getWorkerUser(), workerId, command, env, logPrefix, targetFile);
         }
         LOG.warn("PROFILING REQUEST NOT SUPPORTED {} IGNORED...", request);
         return true;
@@ -443,7 +424,7 @@ public class BasicContainer extends Container {
         return CPJ.join(workercp);
     }
 
-    private String substituteChildOptsInternal(String string, int memOnheap) {
+    private String substituteChildOptsInternal(String string, int memOnheap, int memOffheap) {
         if (StringUtils.isNotBlank(string)) {
             String p = String.valueOf(port);
             string = string.replace("%ID%", p);
@@ -453,6 +434,9 @@ public class BasicContainer extends Container {
             if (memOnheap > 0) {
                 string = string.replace("%HEAP-MEM%", String.valueOf(memOnheap));
             }
+            if (memOffheap > 0) {
+                string = string.replace("%OFF-HEAP-MEM%", String.valueOf(memOffheap));
+            }
             if (memoryLimitMb > 0) {
                 string = string.replace("%LIMIT-MEM%", String.valueOf(memoryLimitMb));
             }
@@ -461,13 +445,13 @@ public class BasicContainer extends Container {
     }
 
     protected List<String> substituteChildopts(Object value) {
-        return substituteChildopts(value, -1);
+        return substituteChildopts(value, -1, -1);
     }
 
-    protected List<String> substituteChildopts(Object value, int memOnheap) {
+    protected List<String> substituteChildopts(Object value, int memOnheap, int memOffHeap) {
         List<String> rets = new ArrayList<>();
         if (value instanceof String) {
-            String string = substituteChildOptsInternal((String) value, memOnheap);
+            String string = substituteChildOptsInternal((String) value, memOnheap, memOffHeap);
             if (StringUtils.isNotBlank(string)) {
                 String[] strings = string.split("\\s+");
                 for (String s : strings) {
@@ -480,33 +464,13 @@ public class BasicContainer extends Container {
             @SuppressWarnings("unchecked")
             List<String> objects = (List<String>) value;
             for (String object : objects) {
-                String str = substituteChildOptsInternal(object, memOnheap);
+                String str = substituteChildOptsInternal(object, memOnheap, memOffHeap);
                 if (StringUtils.isNotBlank(str)) {
                     rets.add(str);
                 }
             }
         }
         return rets;
-    }
-
-    /**
-     * Launch the worker process (non-blocking).
-     *
-     * @param command             the command to run
-     * @param env                 the environment to run the command
-     * @param processExitCallback a callback for when the process exits
-     * @param logPrefix           the prefix to include in the logs
-     * @param targetDir           the working directory to run the command in
-     * @return true if it ran successfully, else false
-     *
-     * @throws IOException on any error
-     */
-    protected void launchWorkerProcess(List<String> command, Map<String, String> env, String logPrefix,
-                                       ExitCodeCallback processExitCallback, File targetDir) throws IOException {
-        if (resourceIsolationManager != null) {
-            command = resourceIsolationManager.getLaunchCommand(workerId, command);
-        }
-        ClientSupervisorUtils.launchProcess(command, env, logPrefix, processExitCallback, targetDir);
     }
 
     private String getWorkerLoggingConfigFile() {
@@ -585,10 +549,20 @@ public class BasicContainer extends Container {
         return memOnheap;
     }
 
-    private List<String> getWorkerProfilerChildOpts(int memOnheap) {
+    private int getMemOffHeap(WorkerResources resources) {
+        int memOffheap = 0;
+        if (resources != null && resources.is_set_mem_off_heap() && resources.get_mem_off_heap() > 0) {
+            memOffheap = (int) Math.ceil(resources.get_mem_off_heap());
+        }
+        return memOffheap;
+    }
+
+    private List<String> getWorkerProfilerChildOpts(int memOnheap, int memOffheap) {
         List<String> workerProfilerChildopts = new ArrayList<>();
         if (ObjectReader.getBoolean(conf.get(DaemonConfig.WORKER_PROFILER_ENABLED), false)) {
-            workerProfilerChildopts = substituteChildopts(conf.get(DaemonConfig.WORKER_PROFILER_CHILDOPTS), memOnheap);
+            workerProfilerChildopts = substituteChildopts(
+                    conf.get(DaemonConfig.WORKER_PROFILER_CHILDOPTS), memOnheap, memOffheap
+            );
         }
         return workerProfilerChildopts;
     }
@@ -614,8 +588,8 @@ public class BasicContainer extends Container {
      *
      * @throws IOException on any error.
      */
-    private List<String> mkLaunchCommand(final int memOnheap, final String stormRoot,
-                                         final String jlp) throws IOException {
+    private List<String> mkLaunchCommand(final int memOnheap, final int memOffheap, final String stormRoot,
+                                         final String jlp, final String numaId) throws IOException {
         final String javaCmd = javaCmd("java");
         final String stormOptions = ConfigUtils.concatIfNotNull(System.getProperty("storm.options"));
         final String topoConfFile = ConfigUtils.concatIfNotNull(System.getProperty("storm.conf.file"));
@@ -652,12 +626,12 @@ public class BasicContainer extends Container {
         commandList.add("-server");
         commandList.addAll(commonParams);
         commandList.add("-Dlog4j.configurationFile=" + workerLog4jConfig);
-        commandList.addAll(substituteChildopts(conf.get(Config.WORKER_CHILDOPTS), memOnheap));
-        commandList.addAll(substituteChildopts(topoConf.get(Config.TOPOLOGY_WORKER_CHILDOPTS), memOnheap));
+        commandList.addAll(substituteChildopts(conf.get(Config.WORKER_CHILDOPTS), memOnheap, memOffheap));
+        commandList.addAll(substituteChildopts(topoConf.get(Config.TOPOLOGY_WORKER_CHILDOPTS), memOnheap, memOffheap));
         commandList.addAll(substituteChildopts(Utils.OR(
             topoConf.get(Config.TOPOLOGY_WORKER_GC_CHILDOPTS),
-            conf.get(Config.WORKER_GC_CHILDOPTS)), memOnheap));
-        commandList.addAll(getWorkerProfilerChildOpts(memOnheap));
+            conf.get(Config.WORKER_GC_CHILDOPTS)), memOnheap, memOffheap));
+        commandList.addAll(getWorkerProfilerChildOpts(memOnheap, memOffheap));
         commandList.add("-Djava.library.path=" + jlp);
         commandList.add("-Dstorm.conf.file=" + topoConfFile);
         commandList.add("-Dstorm.options=" + stormOptions);
@@ -665,8 +639,11 @@ public class BasicContainer extends Container {
         commandList.addAll(classPathParams);
         commandList.add(getWorkerMain(topoVersion));
         commandList.add(topologyId);
+        String supervisorId = this.supervisorId;
+        if (numaId != null) {
+            supervisorId += ServerConstants.NUMA_ID_SEPARATOR + numaId;
+        }
         commandList.add(supervisorId);
-
         // supervisor port should be only presented to worker which supports RPC heartbeat
         // unknown version should be treated as "current version", which supports RPC heartbeat
         if ((topoVersion.getMajor() == -1 && topoVersion.getMinor() == -1)
@@ -685,7 +662,7 @@ public class BasicContainer extends Container {
         if (super.isMemoryLimitViolated(withUpdatedLimits)) {
             return true;
         }
-        if (resourceIsolationManager != null) {
+        if (resourceIsolationManager.isResourceManaged()) {
             // In the short term the goal is to not shoot anyone unless we really need to.
             // The on heap should limit the memory usage in most cases to a reasonable amount
             // If someone is using way more than they requested this is a bug and we should
@@ -781,8 +758,8 @@ public class BasicContainer extends Container {
     public long getMemoryUsageMb() {
         try {
             long ret = 0;
-            if (resourceIsolationManager != null) {
-                long usageBytes = resourceIsolationManager.getMemoryUsage(workerId);
+            if (resourceIsolationManager.isResourceManaged()) {
+                long usageBytes = resourceIsolationManager.getMemoryUsage(getWorkerUser(), workerId, port);
                 if (usageBytes >= 0) {
                     ret = usageBytes / 1024 / 1024;
                 }
@@ -801,7 +778,7 @@ public class BasicContainer extends Container {
 
     private long calculateMemoryLimit(final WorkerResources resources, final int memOnHeap) {
         long ret = memOnHeap;
-        if (resourceIsolationManager != null) {
+        if (resourceIsolationManager.isResourceManaged()) {
             final int memoffheap = (int) Math.ceil(resources.get_mem_off_heap());
             final int extraMem =
                 (int)
@@ -817,12 +794,19 @@ public class BasicContainer extends Container {
     @Override
     public void launch() throws IOException {
         type.assertFull();
-        LOG.info("Launching worker with assignment {} for this supervisor {} on port {} with id {}", assignment,
-                supervisorId, port, workerId);
+        String numaId = SupervisorUtils.getNumaIdForPort(port, conf);
+        if (numaId == null) {
+            LOG.info("Launching worker with assignment {} for this supervisor {} on port {} with id {}",
+                    assignment, supervisorId, port, workerId);
+        } else {
+            LOG.info("Launching worker with assignment {} for this supervisor {} on port {} with id {}  bound to numa zone {}",
+                    assignment, supervisorId, port, workerId, numaId);
+        }
         exitedEarly = false;
 
         final WorkerResources resources = assignment.get_resources();
         final int memOnHeap = getMemOnHeap(resources);
+        final int memOffHeap = getMemOffHeap(resources);
         memoryLimitMb = calculateMemoryLimit(resources, memOnHeap);
         final String stormRoot = ConfigUtils.supervisorStormDistRoot(conf, topologyId);
         String jlp = javaLibraryPath(stormRoot, conf);
@@ -841,13 +825,13 @@ public class BasicContainer extends Container {
 
         topEnvironment.put("LD_LIBRARY_PATH", jlp);
 
-        if (resourceIsolationManager != null) {
+        if (resourceIsolationManager.isResourceManaged()) {
             final int cpu = (int) Math.ceil(resources.get_cpu());
             //Save the memory limit so we can enforce it less strictly
-            resourceIsolationManager.reserveResourcesForWorker(workerId, (int) memoryLimitMb, cpu);
+            resourceIsolationManager.reserveResourcesForWorker(workerId, (int) memoryLimitMb, cpu, numaId);
         }
 
-        List<String> commandList = mkLaunchCommand(memOnHeap, stormRoot, jlp);
+        List<String> commandList = mkLaunchCommand(memOnHeap, memOffHeap, stormRoot, jlp, numaId);
 
         LOG.info("Launching worker with command: {}. ", ServerUtils.shellCmd(commandList));
 
@@ -855,7 +839,8 @@ public class BasicContainer extends Container {
 
         String logPrefix = "Worker Process " + workerId;
         ProcessExitCallback processExitCallback = new ProcessExitCallback(logPrefix);
-        launchWorkerProcess(commandList, topEnvironment, logPrefix, processExitCallback, new File(workerDir));
+        resourceIsolationManager.launchWorkerProcess(getWorkerUser(), topologyId, topoConf, port, workerId,
+            commandList, topEnvironment, logPrefix, processExitCallback, new File(workerDir));
     }
 
     private static class TopologyMetaData {

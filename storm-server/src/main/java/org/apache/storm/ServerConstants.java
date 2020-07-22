@@ -10,30 +10,12 @@
  * and limitations under the License.
  */
 
-package org.apache.storm.metrics2;
+package org.apache.storm;
 
-import org.apache.storm.utils.JCQueue;
-
-public class JcMetrics {
-    private final SimpleGauge<Long> capacity;
-    private final SimpleGauge<Long> population;
-
-    JcMetrics(SimpleGauge<Long> capacity,
-              SimpleGauge<Long> population) {
-        this.capacity = capacity;
-        this.population = population;
-    }
-
-    public void setCapacity(Long capacity) {
-        this.capacity.set(capacity);
-    }
-
-    public void setPopulation(Long population) {
-        this.population.set(population);
-    }
-
-    public void set(JCQueue.QueueMetrics metrics) {
-        this.capacity.set(metrics.capacity());
-        this.population.set(metrics.population());
-    }
+public class ServerConstants {
+    public static final String NUMA_MEMORY_IN_MB = "numa.memory.mb";
+    public static final String NUMA_CORES = "numa.cores";
+    public static final String NUMA_PORTS = "numa.ports";
+    public static final String NUMA_GENERIC_RESOURCES_MAP = "numa.generic.resources.map";
+    public static final String NUMA_ID_SEPARATOR = "-numa-";
 }

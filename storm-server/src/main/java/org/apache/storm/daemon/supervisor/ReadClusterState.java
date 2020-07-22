@@ -23,7 +23,6 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
-import org.apache.storm.DaemonConfig;
 import org.apache.storm.cluster.IStormClusterState;
 import org.apache.storm.daemon.supervisor.Slot.MachineState;
 import org.apache.storm.daemon.supervisor.Slot.TopoProfileAction;
@@ -98,9 +97,9 @@ public class ReadClusterState implements Runnable, AutoCloseable {
         }
 
         @SuppressWarnings("unchecked")
-        List<Number> ports = (List<Number>) superConf.get(DaemonConfig.SUPERVISOR_SLOTS_PORTS);
-        for (Number port : ports) {
-            slots.put(port.intValue(), mkSlot(port.intValue()));
+        List<Integer> ports = SupervisorUtils.getSlotsPorts(superConf);
+        for (Integer port : ports) {
+            slots.put(port, mkSlot(port));
         }
 
         try {
@@ -113,6 +112,7 @@ public class ReadClusterState implements Runnable, AutoCloseable {
                 }
             }
             if (!detachedRunningWorkers.isEmpty()) {
+                LOG.info("Killing detached workers {}", detachedRunningWorkers);
                 supervisor.killWorkers(detachedRunningWorkers, launcher);
             }
         } catch (Exception e) {
@@ -247,7 +247,7 @@ public class ReadClusterState implements Runnable, AutoCloseable {
         Map<NodeInfo, WorkerResources> nodeInfoWorkerResourcesMap = assignment.get_worker_resources();
         if (nodeInfoWorkerResourcesMap != null) {
             for (Map.Entry<NodeInfo, WorkerResources> entry : nodeInfoWorkerResourcesMap.entrySet()) {
-                if (entry.getKey().get_node().equals(assignmentId)) {
+                if (entry.getKey().get_node().startsWith(assignmentId)) {
                     Set<Long> ports = entry.getKey().get_port();
                     for (Long port : ports) {
                         slotsResources.put(port, entry.getValue());
@@ -267,7 +267,7 @@ public class ReadClusterState implements Runnable, AutoCloseable {
         Map<List<Long>, NodeInfo> executorNodePort = assignment.get_executor_node_port();
         if (executorNodePort != null) {
             for (Map.Entry<List<Long>, NodeInfo> entry : executorNodePort.entrySet()) {
-                if (entry.getValue().get_node().equals(assignmentId)) {
+                if (entry.getValue().get_node().startsWith(assignmentId)) {
                     for (Long port : entry.getValue().get_port()) {
                         LocalAssignment localAssignment = portTasks.get(port.intValue());
                         if (localAssignment == null) {

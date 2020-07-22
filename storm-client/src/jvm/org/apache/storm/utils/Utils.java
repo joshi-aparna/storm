@@ -122,7 +122,9 @@ public class Utils {
     // tests by subclassing.
     private static Utils _instance = new Utils();
     private static String memoizedLocalHostnameString = null;
-    public static final Pattern TOPOLOGY_KEY_PATTERN = Pattern.compile("^[\\w \\t\\._-]+$", Pattern.UNICODE_CHARACTER_CLASS);
+    public static final Pattern BLOB_KEY_PATTERN =
+            Pattern.compile("^[\\w \\t\\._-]+$", Pattern.UNICODE_CHARACTER_CLASS);
+    private static final Pattern TOPOLOGY_NAME_REGEX = Pattern.compile("^[^/.:\\\\]+$");
 
     static {
         localConf = readStormConfig();
@@ -346,13 +348,13 @@ public class Utils {
             } catch (Exception e) {
                 LOG.warn("Exception in the ShutDownHook", e);
             }
-        });
+        }, "ShutdownHook-sleepKill-" + numSecs + "s");
         sleepKill.setDaemon(true);
-        Thread wrappedFunc = new Thread(() -> {
+        Thread shutdownFunc = new Thread(() -> {
             func.run();
             sleepKill.interrupt();
-        });
-        Runtime.getRuntime().addShutdownHook(wrappedFunc);
+        }, "ShutdownHook-shutdownFunc");
+        Runtime.getRuntime().addShutdownHook(shutdownFunc);
         Runtime.getRuntime().addShutdownHook(sleepKill);
     }
 
@@ -628,11 +630,12 @@ public class Utils {
                 && !((String) conf.get(Config.STORM_ZOOKEEPER_TOPOLOGY_AUTH_SCHEME)).isEmpty());
     }
 
-    public static void handleUncaughtException(Throwable t) {
-        handleUncaughtException(t, defaultAllowedExceptions);
-    }
-
-    public static void handleUncaughtException(Throwable t, Set<Class<?>> allowedExceptions) {
+    /**
+     * Handles uncaught exceptions.
+     *
+     * @param worker true if this is for handling worker exceptions
+     */
+    public static void handleUncaughtException(Throwable t, Set<Class<?>> allowedExceptions, boolean worker) {
         if (t != null) {
             if (t instanceof OutOfMemoryError) {
                 try {
@@ -649,8 +652,36 @@ public class Utils {
             return;
         }
 
+        if (worker && isAllowedWorkerException(t)) {
+            LOG.info("Swallowing {} {}", t.getClass(), t);
+            return;
+        }
+
         //Running in daemon mode, we would pass Error to calling thread.
         throw new Error(t);
+    }
+
+    public static void handleUncaughtException(Throwable t) {
+        handleUncaughtException(t, defaultAllowedExceptions, false);
+    }
+
+    public static void handleWorkerUncaughtException(Throwable t) {
+        handleUncaughtException(t, defaultAllowedExceptions, true);
+    }
+
+    // Hadoop UserGroupInformation can launch an autorenewal thread that can cause a NullPointerException
+    // for workers.  See STORM-3606 for an explanation.
+    private static boolean isAllowedWorkerException(Throwable t) {
+        if (t instanceof NullPointerException) {
+            StackTraceElement[] stackTrace = t.getStackTrace();
+            for (StackTraceElement trace : stackTrace) {
+                if (trace.getClassName().startsWith("org.apache.hadoop.security.UserGroupInformation")
+                        && trace.getMethodName().equals("run")) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     public static byte[] thriftSerialize(TBase t) {
@@ -1018,9 +1049,24 @@ public class Utils {
             }
         };
     }
-    
+
+    public static UncaughtExceptionHandler createWorkerUncaughtExceptionHandler() {
+        return (thread, thrown) -> {
+            try {
+                handleWorkerUncaughtException(thrown);
+            } catch (Error err) {
+                LOG.error("Received error in thread {}.. terminating worker...", thread.getName(), err);
+                Runtime.getRuntime().exit(-2);
+            }
+        };
+    }
+
     public static void setupDefaultUncaughtExceptionHandler() {
         Thread.setDefaultUncaughtExceptionHandler(createDefaultUncaughtExceptionHandler());
+    }
+
+    public static void setupWorkerUncaughtExceptionHandler() {
+        Thread.setDefaultUncaughtExceptionHandler(createWorkerUncaughtExceptionHandler());
     }
 
     /**
@@ -1755,17 +1801,29 @@ public class Utils {
     }
 
     /**
-     * Validates topology name / blob key.
+     * Validates blob key.
      *
-     * @param key topology name / Key for the blob.
+     * @param key Key for the blob.
      */
     public static boolean isValidKey(String key) {
-        if (StringUtils.isEmpty(key) || "..".equals(key) || ".".equals(key) || !TOPOLOGY_KEY_PATTERN.matcher(key).matches()) {
+        if (StringUtils.isEmpty(key) || "..".equals(key) || ".".equals(key) || !BLOB_KEY_PATTERN.matcher(key).matches()) {
             LOG.error("'{}' does not appear to be valid. It must match {}. And it can't be \".\", \"..\", null or empty string.", key,
-                    TOPOLOGY_KEY_PATTERN);
+                BLOB_KEY_PATTERN);
             return false;
         }
         return true;
+    }
+
+    /**
+     * Validates topology name.
+     * @param name the topology name
+     * @throws IllegalArgumentException if the topology name is not valid
+     */
+    public static void validateTopologyName(String name) throws IllegalArgumentException {
+        if (name == null || !TOPOLOGY_NAME_REGEX.matcher(name).matches()) {
+            String message = "Topology name '" + name + "' is not valid. It can't be null and it must match " + TOPOLOGY_NAME_REGEX;
+            throw new IllegalArgumentException(message);
+        }
     }
 
     /**

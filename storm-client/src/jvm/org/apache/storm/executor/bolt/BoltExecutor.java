@@ -122,9 +122,6 @@ public class BoltExecutor extends Executor {
                 ((ICredentialsListener) boltObject).setCredentials(credentials);
             }
             if (Constants.SYSTEM_COMPONENT_ID.equals(componentId)) {
-                Map<String, JCQueue> map = ImmutableMap.of("receive", receiveQueue, "transfer", workerData.getTransferQueue());
-                BuiltinMetricsUtil.registerQueueMetrics(map, topoConf, userContext);
-
                 Map<NodeInfo, IConnection> cachedNodePortToSocket = workerData.getCachedNodeToPortSocket().get();
                 BuiltinMetricsUtil.registerIconnectionClientMetrics(cachedNodePortToSocket, topoConf, userContext);
                 BuiltinMetricsUtil.registerIconnectionServerMetric(workerData.getReceiver(), topoConf, userContext);
@@ -138,9 +135,6 @@ public class BoltExecutor extends Executor {
                         }
                     }
                 }
-            } else {
-                Map<String, JCQueue> map = ImmutableMap.of("receive", receiveQueue);
-                BuiltinMetricsUtil.registerQueueMetrics(map, topoConf, userContext);
             }
 
             this.outputCollector = new BoltOutputCollectorImpl(this, taskData, rand, hasEventLoggers, ackingEnabled, isDebug);
@@ -163,6 +157,7 @@ public class BoltExecutor extends Executor {
 
             @Override
             public Long call() throws Exception {
+                updateExecCredsIfRequired();
                 boolean pendingEmitsIsEmpty = tryFlushPendingEmits();
                 if (pendingEmitsIsEmpty) {
                     if (bpIdleCount != 0) {
@@ -216,12 +211,6 @@ public class BoltExecutor extends Executor {
             outputCollector.flush();
         } else if (Constants.METRICS_TICK_STREAM_ID.equals(streamId)) {
             metricsTick(idToTask.get(taskId - idToTaskBase), tuple);
-        } else if (Constants.CREDENTIALS_CHANGED_STREAM_ID.equals(streamId)) {
-            Object taskObject = idToTask.get(taskId - idToTaskBase).getTaskObject();
-            if (taskObject instanceof ICredentialsListener) {
-                Credentials creds = (Credentials) tuple.getValue(0);
-                ((ICredentialsListener) taskObject).setCredentials(creds == null ? null : creds.get_creds());
-            }
         } else {
             IBolt boltObject = (IBolt) idToTask.get(taskId - idToTaskBase).getTaskObject();
             boolean isSampled = sampler.getAsBoolean();

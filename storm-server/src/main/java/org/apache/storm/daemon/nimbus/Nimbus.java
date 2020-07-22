@@ -57,8 +57,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.security.auth.Subject;
 
@@ -398,7 +396,6 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             .build();
     private static final List<String> EMPTY_STRING_LIST = Collections.unmodifiableList(Collections.emptyList());
     private static final Set<String> EMPTY_STRING_SET = Collections.unmodifiableSet(Collections.emptySet());
-    private static final Pattern TOPOLOGY_NAME_REGEX = Pattern.compile("^[^/.:\\\\]+$");
     private static final RotatingMap<String, Long> topologyCleanupDetected = new RotatingMap<>(2);
     private static long topologyCleanupRotationTime = 0L;
 
@@ -589,7 +586,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         this.blobStore.setLeaderElector(this.leaderElector);
 
         this.topoCache = topoCache;
-        this.assignmentsDistributer = AssignmentDistributionService.getInstance(conf);
+        this.assignmentsDistributer = AssignmentDistributionService.getInstance(conf, this.scheduler);
         this.idToSchedStatus = new AtomicReference<>(new HashMap<>());
         this.nodeIdToResources = new AtomicReference<>(new HashMap<>());
         this.idToResources = new AtomicReference<>(new HashMap<>());
@@ -645,8 +642,8 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
 
     private static IScheduler wrapAsBlacklistScheduler(Map<String, Object> conf, IScheduler scheduler,
         StormMetricsRegistry metricsRegistry) {
-        BlacklistScheduler blacklistWrappedScheduler = new BlacklistScheduler(scheduler, metricsRegistry);
-        blacklistWrappedScheduler.prepare(conf);
+        BlacklistScheduler blacklistWrappedScheduler = new BlacklistScheduler(scheduler);
+        blacklistWrappedScheduler.prepare(conf, metricsRegistry);
         return blacklistWrappedScheduler;
     }
 
@@ -1124,6 +1121,21 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         ret.put(Config.TOPOLOGY_EVENTLOGGER_EXECUTORS, mergedConf.get(Config.TOPOLOGY_EVENTLOGGER_EXECUTORS));
         ret.put(Config.TOPOLOGY_MAX_TASK_PARALLELISM, mergedConf.get(Config.TOPOLOGY_MAX_TASK_PARALLELISM));
 
+        // storm.messaging.netty.authentication is about inter-worker communication
+        // enforce netty authentication when either topo or daemon set it to true
+        boolean enforceNettyAuth = false;
+        if (!topoConf.containsKey(Config.STORM_MESSAGING_NETTY_AUTHENTICATION)) {
+            enforceNettyAuth = (Boolean) conf.get(Config.STORM_MESSAGING_NETTY_AUTHENTICATION);
+        } else {
+            enforceNettyAuth = (Boolean) topoConf.get(Config.STORM_MESSAGING_NETTY_AUTHENTICATION)
+                                || (Boolean) conf.get(Config.STORM_MESSAGING_NETTY_AUTHENTICATION);
+        }
+        LOG.debug("For netty authentication, topo conf is: {}, cluster conf is: {}, Enforce netty auth: {}",
+            topoConf.get(Config.STORM_MESSAGING_NETTY_AUTHENTICATION),
+            conf.get(Config.STORM_MESSAGING_NETTY_AUTHENTICATION),
+            enforceNettyAuth);
+        ret.put(Config.STORM_MESSAGING_NETTY_AUTHENTICATION, enforceNettyAuth);
+
         // Don't allow topoConf to override various cluster-specific properties.
         // Specifically adding the cluster settings to the topoConf here will make sure these settings
         // also override the subsequently generated conf picked up locally on the classpath.
@@ -1185,9 +1197,10 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     private static void validateTopologyName(String name) throws InvalidTopologyException {
-        Matcher m = TOPOLOGY_NAME_REGEX.matcher(name);
-        if (!m.matches()) {
-            throw new WrappedInvalidTopologyException("Topology name must match " + TOPOLOGY_NAME_REGEX);
+        try {
+            Utils.validateTopologyName(name);
+        } catch (IllegalArgumentException e) {
+            throw new WrappedInvalidTopologyException(e.getMessage());
         }
     }
 
@@ -1553,22 +1566,44 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     /**
-     * Pick out assignments for specific node from all assignments.
-     *
+     * Pick out assignments for a specific host from all assignments.  This could include multiple NUMA
+     * supervisors on an individual host.
      * @param assignmentMap stormId -> assignment map
-     * @param nodeId        supervisor/node id
+     * @param hostname        hostname
      * @return stormId -> assignment map for the node
      */
-    private static Map<String, Assignment> assignmentsForNode(Map<String, Assignment> assignmentMap, String nodeId) {
+    private static Map<String, Assignment> assignmentsForHost(Map<String, Assignment> assignmentMap, String hostname) {
         Map<String, Assignment> ret = new HashMap<>();
-        assignmentMap.entrySet().stream().filter(assignmentEntry -> assignmentEntry.getValue().get_node_host().keySet()
-                                                                                   .contains(nodeId))
-                     .forEach(assignmentEntry -> {
-                         ret.put(assignmentEntry.getKey(), assignmentEntry.getValue());
-                     });
+
+        assignmentMap.entrySet().stream().filter(assignmentEntry -> assignmentEntry.getValue().get_node_host().values()
+                .contains(hostname))
+                .forEach(assignmentEntry -> {
+                    ret.put(assignmentEntry.getKey(), assignmentEntry.getValue());
+                });
 
         return ret;
     }
+
+    /**
+     * Pick out assignments for specific NodeId from all assignments.
+     *
+     * @param assignmentMap stormId -> assignment map
+     * @param nodeId        supervisor node id
+     * @return stormId -> assignment map for the node
+     */
+    private static Map<String, Assignment> assignmentsForNodeId(Map<String, Assignment> assignmentMap, String nodeId) {
+        Map<String, Assignment> ret = new HashMap<>();
+
+        assignmentMap.entrySet().stream().filter(assignmentEntry -> assignmentEntry.getValue().get_node_host().keySet()
+
+                .contains(nodeId))
+                .forEach(assignmentEntry -> {
+                    ret.put(assignmentEntry.getKey(), assignmentEntry.getValue());
+                });
+
+        return ret;
+    }
+
 
     /**
      * Notify supervisors/nodes assigned assignments.
@@ -1585,8 +1620,9 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
         for (Map.Entry<String, String> nodeEntry : nodeHost.entrySet()) {
             try {
                 String nodeId = nodeEntry.getKey();
+                String hostname = nodeEntry.getValue();
                 SupervisorAssignments supervisorAssignments = new SupervisorAssignments();
-                supervisorAssignments.set_storm_assignment(assignmentsForNode(assignments, nodeEntry.getKey()));
+                supervisorAssignments.set_storm_assignment(assignmentsForHost(assignments, hostname));
                 SupervisorDetails details = supervisorDetails.get(nodeId);
                 Integer serverPort = details != null ? details.getServerPort() : null;
                 service.addAssignmentsForNode(nodeId, nodeEntry.getValue(), serverPort, supervisorAssignments, metricsRegistry);
@@ -1606,12 +1642,12 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
 
     @VisibleForTesting
     static void validateTopologyWorkerMaxHeapSizeConfigs(
-        Map<String, Object> stormConf, StormTopology topology, double defaultWorkerMaxHeapSizeMb) {
+        Map<String, Object> stormConf, StormTopology topology, double defaultWorkerMaxHeapSizeMb) throws InvalidTopologyException {
         double largestMemReq = getMaxExecutorMemoryUsageForTopo(topology, stormConf);
         double topologyWorkerMaxHeapSize =
             ObjectReader.getDouble(stormConf.get(Config.TOPOLOGY_WORKER_MAX_HEAP_SIZE_MB), defaultWorkerMaxHeapSizeMb);
         if (topologyWorkerMaxHeapSize < largestMemReq) {
-            throw new IllegalArgumentException(
+            throw new InvalidTopologyException(
                 "Topology will not be able to be successfully scheduled: Config "
                 + "TOPOLOGY_WORKER_MAX_HEAP_SIZE_MB="
                 + topologyWorkerMaxHeapSize
@@ -2278,6 +2314,11 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     private boolean supportRpcHeartbeat(TopologyDetails topo) {
+        if (stormClusterState.isPacemakerStateStore()) {
+            // While using PacemakerStateStorage, ignore RPC heartbeat.
+            return false;
+        }
+
         if (!topo.getTopology().is_set_storm_version()) {
             // current version supports RPC heartbeat
             return true;
@@ -2897,7 +2938,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                                                       (int) info.get_uptime_secs(), numPorts, numUsedPorts, supervisorId);
         ret.set_total_resources(info.get_resources_map());
         SupervisorResources resources = nodeIdToResources.get().get(supervisorId);
-        if (resources != null) {
+        if (resources != null && underlyingScheduler instanceof ResourceAwareScheduler) {
             ret.set_used_mem(resources.getUsedMem());
             ret.set_used_cpu(resources.getUsedCpu());
             ret.set_used_generic_resources(resources.getUsedGenericResources());
@@ -2996,7 +3037,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 summary.set_sched_status(status);
             }
             TopologyResources resources = getResourcesForTopology(topoId, base);
-            if (resources != null) {
+            if (resources != null  && underlyingScheduler instanceof ResourceAwareScheduler) {
                 summary.set_requested_memonheap(resources.getRequestedMemOnHeap());
                 summary.set_requested_memoffheap(resources.getRequestedMemOffHeap());
                 summary.set_requested_cpu(resources.getRequestedCpu());
@@ -3122,8 +3163,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
             ReqContext req = ReqContext.context();
             Principal principal = req.principal();
             String submitterPrincipal = principal == null ? null : principal.toString();
-            @SuppressWarnings("unchecked")
-            Set<String> topoAcl = new HashSet<>((List<String>) topoConf.getOrDefault(Config.TOPOLOGY_USERS, Collections.emptyList()));
+            Set<String> topoAcl = new HashSet<>(ObjectReader.getStrings(topoConf.get(Config.TOPOLOGY_USERS)));
             topoAcl.add(submitterPrincipal);
             String submitterUser = principalToLocal.toLocal(principal);
             topoAcl.add(submitterUser);
@@ -4088,7 +4128,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 topoInfo.set_sched_status(schedStatus);
             }
             TopologyResources resources = getResourcesForTopology(topoId, common.base);
-            if (resources != null) {
+            if (resources != null && underlyingScheduler instanceof ResourceAwareScheduler) {
                 topoInfo.set_requested_memonheap(resources.getRequestedMemOnHeap());
                 topoInfo.set_requested_memoffheap(resources.getRequestedMemOffHeap());
                 topoInfo.set_requested_cpu(resources.getRequestedCpu());
@@ -4188,7 +4228,7 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
                 topoPageInfo.set_sched_status(schedStatus);
             }
             TopologyResources resources = getResourcesForTopology(topoId, base);
-            if (resources != null) {
+            if (resources != null && underlyingScheduler instanceof ResourceAwareScheduler) {
                 topoPageInfo.set_requested_memonheap(resources.getRequestedMemOnHeap());
                 topoPageInfo.set_requested_memoffheap(resources.getRequestedMemOffHeap());
                 topoPageInfo.set_requested_cpu(resources.getRequestedCpu());
@@ -4769,23 +4809,23 @@ public class Nimbus implements Iface, Shutdownable, DaemonCommon {
     }
 
     @Override
-    public SupervisorAssignments getSupervisorAssignments(String node) throws AuthorizationException, TException {
+    public SupervisorAssignments getSupervisorAssignments(String nodeId) throws AuthorizationException, TException {
         checkAuthorization(null, null, "getSupervisorAssignments");
         try {
             if (isLeader() && isAssignmentsRecovered()) {
                 SupervisorAssignments supervisorAssignments = new SupervisorAssignments();
-                supervisorAssignments.set_storm_assignment(assignmentsForNode(stormClusterState.assignmentsInfo(), node));
+                supervisorAssignments.set_storm_assignment(assignmentsForNodeId(stormClusterState.assignmentsInfo(), nodeId));
                 return supervisorAssignments;
             }
         } catch (Exception e) {
-            LOG.debug("Exception when node {} fetching assignments", node);
+            LOG.debug("Exception when node {} fetching assignments", nodeId);
             if (e instanceof TException) {
                 throw (TException) e;
             }
             // When this master is not leader and get a sync request from node,
             // just return nil which will cause client/node to get an unknown error,
             // the node/supervisor will sync it as a timer task.
-            LOG.debug("Exception when node {} fetching assignments", node);
+            LOG.debug("Exception when node {} fetching assignments", nodeId);
         }
         return null;
     }

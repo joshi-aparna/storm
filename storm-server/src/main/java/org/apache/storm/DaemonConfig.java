@@ -43,6 +43,7 @@ import org.apache.storm.scheduler.resource.strategies.priority.ISchedulingPriori
 import org.apache.storm.scheduler.resource.strategies.scheduling.IStrategy;
 import org.apache.storm.security.auth.IAuthorizer;
 import org.apache.storm.security.auth.IHttpCredentialsPlugin;
+import org.apache.storm.utils.DaemonConfigValidation;
 import org.apache.storm.validation.ConfigValidation;
 import org.apache.storm.validation.Validated;
 
@@ -119,6 +120,13 @@ public class DaemonConfig implements Validated {
      */
     @IsPositiveNumber
     public static final String BLACKLIST_SCHEDULER_RESUME_TIME = "blacklist.scheduler.resume.time.secs";
+
+    /**
+     * Enables blacklisting support for supervisors with failed send assignment calls.
+     */
+    @IsBoolean
+    public static final String BLACKLIST_SCHEDULER_ENABLE_SEND_ASSIGNMENT_FAILURES =
+            "blacklist.scheduler.enable.send.assignment.failures";
 
     /**
      * The class that the blacklist scheduler will report the blacklist.
@@ -475,15 +483,21 @@ public class DaemonConfig implements Validated {
     public static final String LOGVIEWER_HTTPS_NEED_CLIENT_AUTH = "logviewer.https.need.client.auth";
 
     /**
+     * If set to true, keystore and truststore for Logviewer will be automatically reloaded when modified.
+     */
+    @IsBoolean
+    public static final String LOGVIEWER_HTTPS_ENABLE_SSL_RELOAD = "logviewer.https.enable.ssl.reload";
+
+    /**
      * A list of users allowed to view logs via the Log Viewer.
      */
-    @IsStringList
+    @IsStringOrStringList
     public static final String LOGS_USERS = "logs.users";
 
     /**
      * A list of groups allowed to view logs via the Log Viewer.
      */
-    @IsStringList
+    @IsStringOrStringList
     public static final String LOGS_GROUPS = "logs.groups";
 
     /**
@@ -595,6 +609,12 @@ public class DaemonConfig implements Validated {
     public static final String UI_HTTPS_NEED_CLIENT_AUTH = "ui.https.need.client.auth";
 
     /**
+     * If set to true, keystore and truststore for UI will be automatically reloaded when modified.
+     */
+    @IsBoolean
+    public static final String UI_HTTPS_ENABLE_SSL_RELOAD = "ui.https.enable.ssl.reload";
+
+    /**
      * The maximum number of threads that should be used by the Pacemaker. When Pacemaker gets loaded it will spawn new threads, up to this
      * many total, to handle the load.
      */
@@ -680,6 +700,12 @@ public class DaemonConfig implements Validated {
     public static final String DRPC_HTTPS_NEED_CLIENT_AUTH = "drpc.https.need.client.auth";
 
     /**
+     * If set to true, keystore and truststore for DRPC Server will be automatically reloaded when modified.
+     */
+    @IsBoolean
+    public static final String DRPC_HTTPS_ENABLE_SSL_RELOAD = "drpc.https.enable.ssl.reload";
+
+    /**
      * Class name for authorization plugin for DRPC client.
      */
     @IsString
@@ -749,6 +775,23 @@ public class DaemonConfig implements Validated {
     @IsPositiveNumber
     @IsInteger
     public static final String SUPERVISOR_BLOBSTORE_DOWNLOAD_MAX_RETRIES = "supervisor.blobstore.download.max_retries";
+
+    /**
+     * A map with keys mapped to each NUMA Node on the supervisor that will be used
+     * by scheduler. CPUs, memory and ports available on each NUMA node will be provided.
+     * Each supervisor will have different map of NUMAs.
+     * Example: "supervisor.numa.meta": {
+     *  "0": { "numa.memory.mb": 122880, "numa.cores": [ 0, 12, 1, 13, 2, 14, 3, 15, 4, 16, 5, 17],
+     *      "numa.ports": [6700, 6701]},
+     *  "1" : {"numa.memory.mb": 122880, "numa.cores": [ 6, 18, 7, 19, 8, 20, 9, 21, 10, 22, 11, 23],
+     *      "numa.ports": [6702, 6703], "numa.generic.resources.map": {"gpu.count" : 1}}
+     *  }
+     */
+    @IsMapEntryCustom(
+            keyValidatorClasses = { ConfigValidation.StringValidator.class },
+            valueValidatorClasses = { DaemonConfigValidation.NumaEntryValidator.class}
+    )
+    public static final String SUPERVISOR_NUMA_META = "supervisor.numa.meta";
 
     /**
      * What blobstore implementation nimbus should use.
@@ -893,6 +936,13 @@ public class DaemonConfig implements Validated {
      */
     @IsMapEntryType(keyType = String.class, valueType = Number.class)
     public static final String ISOLATION_SCHEDULER_MACHINES = "isolation.scheduler.machines";
+
+    /**
+     * How long before a scheduler considers its config cache expired.
+     */
+    @IsInteger
+    @IsPositiveNumber(includeZero = true)
+    public static final String SCHEDULER_CONFIG_CACHE_EXPIRATION_SECS = "scheduler.config.cache.expiration.secs";
 
     /**
      * For ArtifactoryConfigLoader, this can either be a reference to an individual file in Artifactory or to a directory. If it is a
